@@ -67,7 +67,7 @@ def _needs_time_context(query: str) -> bool:
 
     return False
 
-RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 
 
 def _is_retryable_exception(exc) -> bool:
@@ -173,13 +173,14 @@ class GrokSearchProvider(BaseSearchProvider):
 
     async def _parse_streaming_response(self, response, ctx=None) -> str:
         content = ""
-        full_body_buffer = [] 
-        
+        reasoning = ""
+        full_body_buffer = []
+
         async for line in response.aiter_lines():
             line = line.strip()
             if not line:
                 continue
-            
+
             full_body_buffer.append(line)
 
             # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
@@ -193,11 +194,21 @@ class GrokSearchProvider(BaseSearchProvider):
                     choices = data.get("choices", [])
                     if choices and len(choices) > 0:
                         delta = choices[0].get("delta", {})
-                        if "content" in delta:
-                            content += delta["content"]
-                except (json.JSONDecodeError, IndexError):
+                        # 推理/多智能体模型的分片里 content 常为 null，
+                        # 直接 += None 会抛 TypeError，必须判类型后再拼接
+                        piece = delta.get("content")
+                        if isinstance(piece, str):
+                            content += piece
+                        rc = delta.get("reasoning_content")
+                        if isinstance(rc, str):
+                            reasoning += rc
+                except (json.JSONDecodeError, IndexError, TypeError):
                     continue
-                
+
+        # 兜底：若正文始终为空（模型只产出 reasoning_content），退回推理内容
+        if not content and reasoning:
+            content = reasoning
+
         if not content and full_body_buffer:
             try:
                 full_text = "".join(full_body_buffer)
@@ -214,7 +225,7 @@ class GrokSearchProvider(BaseSearchProvider):
 
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
         """执行带重试机制的流式 HTTP 请求"""
-        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+        timeout = httpx.Timeout(connect=6.0, read=180.0, write=10.0, pool=None)
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async for attempt in AsyncRetrying(
